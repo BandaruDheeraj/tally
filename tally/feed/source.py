@@ -69,11 +69,7 @@ def poll_interval(
     """Exponential backoff: min(base * 2^cycles_polled, cap)."""
     base_secs = base.total_seconds()
     cap_secs = cap.total_seconds()
-    # Avoid overflow: if exponent would push past cap, return cap directly
-    try:
-        seconds = base_secs * (2**cycles_polled)
-    except (OverflowError, ValueError):
-        return cap
+    seconds = base_secs * (2**cycles_polled)
     if seconds >= cap_secs:
         return cap
     return timedelta(seconds=seconds)

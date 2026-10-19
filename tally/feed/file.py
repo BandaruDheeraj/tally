@@ -33,12 +33,11 @@ class FileEvalSource(EvalSource):
             if ended_at <= cursor:
                 continue
             attrs: dict[str, object] = s["attributes"]  # type: ignore[assignment]
-            customer_id = _extract_customer(policy.customer, attrs)
             results.append(
                 SpanInfo(
                     trace_id=str(s["trace_id"]),
                     span_id=str(s["span_id"]),
-                    customer_id=customer_id,
+                    customer_id=_extract_customer(policy.customer, attrs),
                     span_name=str(s["span_name"]),
                     ended_at=ended_at,
                 )

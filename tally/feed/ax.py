@@ -53,10 +53,9 @@ def _parse_annotations(annotations: list[dict[str, Any]]) -> list[EvalResult]:
 
     results: list[EvalResult] = []
     for name, anns in by_name.items():
-        labels = {a.get("label") for a in anns}
         if len(anns) == 1:
             agreement: str | None = None
-        elif len(labels) == 1:
+        elif len({a.get("label") for a in anns}) == 1:
             agreement = "unanimous"
         else:
             agreement = "split"
@@ -71,7 +70,7 @@ def _parse_annotations(annotations: list[dict[str, Any]]) -> list[EvalResult]:
                     "agreement": agreement,
                     "evaluator_version": ann.get("annotatorKind"),
                     "scored_at": ann["createdAt"],
-                    "raw": dict(ann),
+                    "raw": ann,
                 }
             )
         )
@@ -88,19 +87,18 @@ class AXEvalSource(EvalSource):
         project: str,
         base_url: str = "https://app.arizeai.com",
     ) -> None:
-        self._api_key = api_key
-        self._space_id = space_id
         self._project = project
         self._gql_url = f"{base_url.rstrip('/')}/graphql"
+        self._headers = {
+            "x-api-key": api_key,
+            "x-space-id": space_id,
+            "content-type": "application/json",
+        }
 
     def _graphql(self, query: str, variables: dict[str, Any]) -> dict[str, Any]:
         resp = requests.post(
             self._gql_url,
-            headers={
-                "x-api-key": self._api_key,
-                "x-space-id": self._space_id,
-                "content-type": "application/json",
-            },
+            headers=self._headers,
             json={"query": query, "variables": variables},
             timeout=30,
         )

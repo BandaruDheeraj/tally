@@ -11,7 +11,7 @@ import requests
 from tally.feed.ax import AXEvalSource
 from tally.feed.file import FileEvalSource
 from tally.feed.source import poll_interval
-from tally.policy.declaration import Policy, compute_version
+from tally.policy.declaration import make_policy
 
 FIXTURE = Path(__file__).parent / "fixtures" / "feed_fixture.json"
 
@@ -37,15 +37,15 @@ def test_poll_interval_custom_base_and_cap() -> None:
     assert result == timedelta(seconds=50)  # 10 * 2^3 = 80, capped at 50
 
 
-def _policy(span: str = "post_review_comment", customer: str = "customer_id") -> Policy:
-    src = "def translate(evals):\n    return bill(units=1)\n"
-    version = compute_version("p", span, ["fix_landed"], [], src)
-    return Policy(
-        name="p", span=span, customer=customer,
-        evals=["fix_landed"], watch=[],
-        translate=src, version=version, meter="p",
-        wait=timedelta(days=7),
-    )
+def _translate(evals: object) -> object:
+    return None  # never executed; only source text is used
+
+
+def _policy(
+    span: str = "post_review_comment",
+    customer: str | object = "customer_id",
+) -> object:
+    return make_policy("p", span, customer, ["fix_landed"], _translate)  # type: ignore[arg-type]
 
 
 CURSOR_BEFORE = datetime(2024, 6, 1, 9, 0, tzinfo=timezone.utc)
@@ -153,9 +153,6 @@ def _ax_get_evals_response(annotations: list[dict[str, object]]) -> dict[str, ob
     }
 
 
-def _ax_empty_spans_response() -> dict[str, object]:
-    return {"data": {"project": {"spans": {"edges": []}}}}
-
 
 def _mock_ax(return_value: dict[str, object]) -> MagicMock:
     mock_resp = MagicMock()
@@ -234,7 +231,7 @@ def test_ax_get_evals_split_on_differing_labels() -> None:
 
 def test_ax_get_evals_empty_edges_returns_empty() -> None:
     src = AXEvalSource("key", "space", "proj")
-    with patch("requests.post", return_value=_mock_ax(_ax_empty_spans_response())):
+    with patch("requests.post", return_value=_mock_ax(_ax_list_spans_response([]))):
         evals = src.get_evals("t1", "s1")
     assert evals == []
 

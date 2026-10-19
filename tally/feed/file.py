@@ -19,7 +19,7 @@ class FileEvalSource(EvalSource):
     """EvalSource backed by a JSON fixture file. Used for tests and demo."""
 
     def __init__(self, fixture_path: str | Path) -> None:
-        with open(fixture_path) as f:
+        with open(fixture_path, encoding="utf-8") as f:
             data: dict[str, object] = json.load(f)
         self._spans: list[dict[str, object]] = data["spans"]  # type: ignore[assignment]
         self._evals: dict[str, list[dict[str, object]]] = data["evals"]  # type: ignore[assignment]

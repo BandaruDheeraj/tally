@@ -1,6 +1,9 @@
 from tally.policy.declaration import BillResult as _BillResult
 from tally.policy.declaration import HoldResult as _HoldResult
 from tally.policy.declaration import NoChargeResult as _NoChargeResult
+from tally.sdk.explain import explain as explain
+from tally.sdk.verify import VerificationFailure as VerificationFailure
+from tally.sdk.verify import verify as verify
 
 
 def bill(units: int) -> _BillResult:
@@ -15,4 +18,4 @@ def hold(reason: str) -> _HoldResult:
     return _HoldResult(reason=reason)
 
 
-__all__ = ["bill", "no_charge", "hold"]
+__all__ = ["bill", "no_charge", "hold", "explain", "verify", "VerificationFailure"]

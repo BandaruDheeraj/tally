@@ -27,6 +27,8 @@ class Unit:
     first_seen: datetime
     deadline: datetime
     status: Literal["pending", "decided"] = "pending"
+    last_polled: datetime | None = None
+    cycles_polled: int = 0
 
 
 @dataclass(frozen=True)

@@ -1,0 +1,51 @@
+{
+  "spans": [
+    {
+      "trace_id": "trace-001",
+      "span_id": "span-001",
+      "attributes": {"customer_id": "cust-1", "pr_number": 42},
+      "span_name": "post_review_comment",
+      "ended_at": "2024-06-01T10:00:00Z"
+    },
+    {
+      "trace_id": "trace-002",
+      "span_id": "span-002",
+      "attributes": {"customer_id": "cust-2"},
+      "span_name": "post_review_comment",
+      "ended_at": "2024-06-01T11:00:00Z"
+    },
+    {
+      "trace_id": "trace-003",
+      "span_id": "span-003",
+      "attributes": {"customer_id": "cust-1"},
+      "span_name": "other_span",
+      "ended_at": "2024-06-01T12:00:00Z"
+    }
+  ],
+  "evals": {
+    "trace-001:span-001": [
+      {
+        "name": "fix_landed",
+        "label": "yes",
+        "score": 1.0,
+        "explanation": "The fix was applied",
+        "agreement": null,
+        "evaluator_version": "gpt-4",
+        "scored_at": "2024-06-01T11:00:00Z",
+        "raw": {"source": "fixture"}
+      }
+    ],
+    "trace-002:span-002": [
+      {
+        "name": "fix_landed",
+        "label": "no",
+        "score": 0.0,
+        "explanation": "Fix not found",
+        "agreement": null,
+        "evaluator_version": null,
+        "scored_at": "2024-06-01T12:00:00Z",
+        "raw": {}
+      }
+    ]
+  }
+}

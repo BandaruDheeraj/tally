@@ -33,6 +33,15 @@ class StripeEmitter:
         self._stripe_key = stripe_key
         self._meter = meter
 
+    def _make_emission(self, r: Record, payload: dict[str, object]) -> Record:
+        return make_record(
+            type="EMISSION",
+            trace_id=r.trace_id, span_id=r.span_id, customer_id=r.customer_id,
+            policy_name=r.policy_name, policy_version=r.policy_version,
+            policy_hash=r.policy_hash,
+            payload=payload,
+        )
+
     def emit(self) -> None:
         """Process all pending BILL decisions: emit Stripe events or shadow-write."""
         now = datetime.now(tz=timezone.utc)
@@ -42,19 +51,15 @@ class StripeEmitter:
             for r in self._store.list(type="EMISSION")
         }
 
-        # Collect un-emitted BILL decisions
-        pending: list[Record] = []
-        for r in decisions:
-            if r.payload.get("decision") != "BILL":
-                continue
-            if (r.trace_id, r.span_id) in emitted_spans:
-                continue
-            pending.append(r)
+        pending: list[Record] = [
+            r for r in decisions
+            if r.payload.get("decision") == "BILL"
+            and (r.trace_id, r.span_id) not in emitted_spans
+        ]
 
         if not pending:
             return
 
-        # Mode gate: find latest live-mode switch timestamp
         live_since: datetime | None = None
         if self._mode == "live":
             mode_records = self._store.list(type="MODE")
@@ -66,56 +71,44 @@ class StripeEmitter:
             if live_switches:
                 live_since = max(live_switches)
 
-        # Apply mode gate: shadow-period decisions → immediate shadow EMISSION
-        final_pending: list[Record] = []
+        # Parse decided_at once; apply mode gate; carry timestamp through to _emit_customer
+        final_pending: list[tuple[Record, datetime]] = []
         for r in pending:
             decided_at_str = str(r.payload.get("decided_at", ""))
             decided_at = _parse_dt(decided_at_str) if decided_at_str else now
             if live_since is not None and decided_at <= live_since:
-                self._store.write(make_record(
-                    type="EMISSION",
-                    trace_id=r.trace_id, span_id=r.span_id, customer_id=r.customer_id,
-                    policy_name=r.policy_name, policy_version=r.policy_version,
-                    policy_hash=r.policy_hash,
-                    payload={
-                        "stripe_identifier": f"{r.trace_id}::{r.span_id}",
-                        "shadow": True,
-                        "status": "shadow",
-                    },
-                ))
+                self._store.write(self._make_emission(r, {
+                    "stripe_identifier": f"{r.trace_id}::{r.span_id}",
+                    "shadow": True,
+                    "status": "shadow",
+                }))
             else:
-                final_pending.append(r)
+                final_pending.append((r, decided_at))
 
         if not final_pending:
             return
 
-        # Group by customer for per-customer serialization
-        by_customer: dict[str, list[Record]] = {}
-        for r in final_pending:
-            by_customer.setdefault(r.customer_id, []).append(r)
+        by_customer: dict[str, list[tuple[Record, datetime]]] = {}
+        for r, decided_at in final_pending:
+            by_customer.setdefault(r.customer_id, []).append((r, decided_at))
 
-        with ThreadPoolExecutor(max_workers=len(by_customer)) as executor:
-            for customer_records in by_customer.values():
-                executor.submit(self._emit_customer, customer_records, now)
+        if len(by_customer) == 1:
+            self._emit_customer(next(iter(by_customer.values())), now)
+        else:
+            with ThreadPoolExecutor(max_workers=len(by_customer)) as executor:
+                for customer_records in by_customer.values():
+                    executor.submit(self._emit_customer, customer_records, now)
 
-    def _emit_customer(self, records: list[Record], now: datetime) -> None:
-        for r in records:
-            decided_at_str = str(r.payload.get("decided_at", ""))
-            decided_at = _parse_dt(decided_at_str) if decided_at_str else now
-
-            # Old decision guard
+    def _emit_customer(
+        self, records: list[tuple[Record, datetime]], now: datetime
+    ) -> None:
+        for r, decided_at in records:
             if now - decided_at > _OLD_DECISION_THRESHOLD:
-                self._store.write(make_record(
-                    type="EMISSION",
-                    trace_id=r.trace_id, span_id=r.span_id, customer_id=r.customer_id,
-                    policy_name=r.policy_name, policy_version=r.policy_version,
-                    policy_hash=r.policy_hash,
-                    payload={
-                        "stripe_identifier": f"{r.trace_id}::{r.span_id}",
-                        "shadow": False,
-                        "status": "failed",
-                    },
-                ))
+                self._store.write(self._make_emission(r, {
+                    "stripe_identifier": f"{r.trace_id}::{r.span_id}",
+                    "shadow": False,
+                    "status": "failed",
+                }))
                 logger.warning(
                     "BILL decision too old to emit trace_id=%s span_id=%s",
                     r.trace_id, r.span_id,
@@ -127,17 +120,11 @@ class StripeEmitter:
             units = int(units_raw) if isinstance(units_raw, (int, float)) else 1
 
             if self._mode == "shadow":
-                self._store.write(make_record(
-                    type="EMISSION",
-                    trace_id=r.trace_id, span_id=r.span_id, customer_id=r.customer_id,
-                    policy_name=r.policy_name, policy_version=r.policy_version,
-                    policy_hash=r.policy_hash,
-                    payload={
-                        "stripe_identifier": identifier,
-                        "shadow": True,
-                        "status": "shadow",
-                    },
-                ))
+                self._store.write(self._make_emission(r, {
+                    "stripe_identifier": identifier,
+                    "shadow": True,
+                    "status": "shadow",
+                }))
             else:
                 self._post_stripe(r, identifier, units, decided_at)
 
@@ -167,15 +154,9 @@ class StripeEmitter:
             stripe_response = {}
             status = "failed"
 
-        self._store.write(make_record(
-            type="EMISSION",
-            trace_id=r.trace_id, span_id=r.span_id, customer_id=r.customer_id,
-            policy_name=r.policy_name, policy_version=r.policy_version,
-            policy_hash=r.policy_hash,
-            payload={
-                "stripe_identifier": identifier,
-                "stripe_response": stripe_response,
-                "shadow": False,
-                "status": status,
-            },
-        ))
+        self._store.write(self._make_emission(r, {
+            "stripe_identifier": identifier,
+            "stripe_response": stripe_response,
+            "shadow": False,
+            "status": status,
+        }))

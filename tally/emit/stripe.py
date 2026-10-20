@@ -25,6 +25,7 @@ class StripeEmitter:
         mode: Literal["shadow", "live"],
         stripe_key: str | None,
         meter: str,
+        policy_name: str | None = None,
     ) -> None:
         if mode == "live" and not stripe_key:
             raise ValueError("STRIPE_RESTRICTED_KEY is required in live mode")
@@ -32,6 +33,7 @@ class StripeEmitter:
         self._mode = mode
         self._stripe_key = stripe_key
         self._meter = meter
+        self._policy_name = policy_name
 
     def _make_emission(self, r: Record, payload: dict[str, object]) -> Record:
         return make_record(
@@ -49,12 +51,14 @@ class StripeEmitter:
         emitted_spans = {
             (r.trace_id, r.span_id)
             for r in self._store.list(type="EMISSION")
+            if self._policy_name is None or r.policy_name == self._policy_name
         }
 
         pending: list[Record] = [
             r for r in decisions
             if r.payload.get("decision") == "BILL"
             and (r.trace_id, r.span_id) not in emitted_spans
+            and (self._policy_name is None or r.policy_name == self._policy_name)
         ]
 
         if not pending:

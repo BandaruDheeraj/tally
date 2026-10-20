@@ -17,7 +17,6 @@ class outcome:
 
     def __init__(self, span: str, *, customer: str) -> None:
         self._span = span
-        self._customer = customer
 
     def __call__(self, fn: Callable[..., Any]) -> Callable[..., Any]:
         @functools.wraps(fn)
@@ -40,8 +39,9 @@ class outcome:
         exc_val: BaseException | None,
         exc_tb: TracebackType | None,
     ) -> bool:
-        if exc_type is not None:
+        if exc_type is not None and issubclass(exc_type, Exception):
             logger.exception(
                 "outcome swallowed exception span=%s", self._span
             )
-        return True  # suppress exception
+            return True
+        return False

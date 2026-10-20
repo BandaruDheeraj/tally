@@ -30,11 +30,12 @@ def run_once(
     now = datetime.now(tz=timezone.utc)
 
     # Stage 1: Discover new spans; skip already-decided
+    # Key includes policy_name so two policies can independently decide the same span.
     decided_spans = {
-        (r.trace_id, r.span_id)
+        (r.policy_name, r.trace_id, r.span_id)
         for r in store.list(type="DECISION")
     }
-    units_map: dict[tuple[str, str], tuple[Unit, Policy]] = {}
+    units_map: dict[tuple[str, str, str], tuple[Unit, Policy]] = {}
 
     for policy in policies:
         try:
@@ -43,7 +44,7 @@ def run_once(
             logger.exception("list_new_spans failed policy=%s", policy.name)
             continue
         for span in spans:
-            key = (span.trace_id, span.span_id)
+            key = (policy.name, span.trace_id, span.span_id)
             if key in decided_spans:
                 continue
             units_map[key] = (
@@ -63,7 +64,7 @@ def run_once(
         return
 
     # Stage 2: Poll evals for each pending unit
-    evals_cache: dict[tuple[str, str], list[EvalResult]] = {}
+    evals_cache: dict[tuple[str, str, str], list[EvalResult]] = {}
     for key, (unit, _) in units_map.items():
         try:
             evals_cache[key] = source.get_evals(unit.trace_id, unit.span_id)
@@ -104,14 +105,15 @@ def run_once(
             },
         ))
 
-    # Stage 4: Emit
-    emitter = StripeEmitter(
-        store=store,
-        mode=mode,
-        stripe_key=stripe_key,
-        meter=policies[0].meter if policies else "default",
-    )
-    emitter.emit()
+    # Stage 4: Emit — one emitter per policy so each uses its own meter name.
+    for policy in policies:
+        StripeEmitter(
+            store=store,
+            mode=mode,
+            stripe_key=stripe_key,
+            meter=policy.meter,
+            policy_name=policy.name,
+        ).emit()
 
 
 def run(

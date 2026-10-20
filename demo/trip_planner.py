@@ -206,6 +206,7 @@ def _send_span(
     api_key: str,
     space_id: str,
     user_id: str,
+    session_id: str,
     destination: str,
     plan: str,
     deal_quality_label: str,
@@ -230,12 +231,21 @@ def _send_span(
                 "startTimeUnixNano": now_ns - 5_000_000_000,
                 "endTimeUnixNano": now_ns,
                 "attributes": [
+                    # OpenInference semantic conventions
+                    {"key": "openinference.span.kind",
+                     "value": {"stringValue": "CHAIN"}},
+                    {"key": "session.id",
+                     "value": {"stringValue": session_id}},
                     {"key": "user.id",
                      "value": {"stringValue": user_id}},
                     {"key": "input.value",
                      "value": {"stringValue": f"Plan a trip to {destination}"}},
+                    {"key": "input.mime_type",
+                     "value": {"stringValue": "text/plain"}},
                     {"key": "output.value",
                      "value": {"stringValue": plan}},
+                    {"key": "output.mime_type",
+                     "value": {"stringValue": "text/plain"}},
                     {"key": "destination",
                      "value": {"stringValue": destination}},
                     # Eval attributes — read back by AXEvalSource
@@ -266,9 +276,15 @@ def _send_span(
 # Main
 # ---------------------------------------------------------------------------
 
-def plan_trip(destination: str, user_id: str, api_key: str, space_id: str) -> None:
+def plan_trip(
+    destination: str,
+    user_id: str,
+    session_id: str,
+    api_key: str,
+    space_id: str,
+) -> None:
     print(f"\n{'='*60}")
-    print(f"Planning trip to: {destination}  (user: {user_id})")
+    print(f"Planning trip to: {destination}  (user: {user_id}  session: {session_id[:8]}...)")
     print(f"{'='*60}")
 
     print("Searching the web for deals...")
@@ -286,7 +302,7 @@ def plan_trip(destination: str, user_id: str, api_key: str, space_id: str) -> No
 
     print("\nSending span to Arize...")
     trace_id, span_id = _send_span(
-        api_key, space_id, user_id, destination,
+        api_key, space_id, user_id, session_id, destination,
         plan, quality_label, quality_score,
     )
     print(f"  OK  trace={trace_id[:12]}...  span={span_id[:12]}...")
@@ -307,8 +323,11 @@ def main() -> None:
         print("Error: set ARIZE_API_KEY and ARIZE_SPACE_ID", file=sys.stderr)
         sys.exit(1)
 
+    # One session ID per script run — all destinations are grouped together in Arize
+    session_id = uuid.uuid4().hex
+
     for dest in args.destination:
-        plan_trip(dest, args.user, api_key, space_id)
+        plan_trip(dest, args.user, session_id, api_key, space_id)
 
     print(f"\nDone — {len(args.destination)} trip(s) sent to Arize project '{PROJECT}'")
     print("Run demo/trip_pricing.py to see tally billing decisions.")

@@ -3,11 +3,12 @@ from __future__ import annotations
 import json
 import os
 import secrets
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any
 
 import requests
 
+from tally.feed.source import _EPOCH, _parse_dt
 from tally.log.records import Record, RecordType, make_record
 from tally.log.store import RecordStore
 
@@ -21,22 +22,14 @@ query ListRecords($projectName: String!, $filterCondition: String!, $first: Int!
 }
 """
 
-_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
-
-
-def _parse_dt(s: str) -> datetime:
-    return datetime.fromisoformat(s.replace("Z", "+00:00"))
-
 
 def _pad_trace_id(s: str) -> str:
-    """Zero-pad or fill to 32 hex chars for OTLP."""
     if not s:
         return secrets.token_hex(16)
     return s.replace("-", "").ljust(32, "0")[:32]
 
 
 def _pad_span_id(s: str) -> str:
-    """Zero-pad or fill to 16 hex chars for OTLP."""
     if not s:
         return secrets.token_hex(8)
     return s.replace("-", "").ljust(16, "0")[:16]

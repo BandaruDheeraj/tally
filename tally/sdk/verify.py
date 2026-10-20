@@ -1,15 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
 
-from tally.feed.source import EvalResult
+from tally.feed.source import _EPOCH, EvalResult
 from tally.log.records import compute_content_hash
 from tally.log.store import RecordStore
 from tally.policy.declaration import BillResult, HoldResult, NoChargeResult
 from tally.policy.engine import _run_translate
-
-_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 
 @dataclass(frozen=True)

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Callable
 
 if TYPE_CHECKING:
@@ -28,6 +28,9 @@ class EvalResult:
     evaluator_version: str | None
     scored_at: datetime
     raw: dict[str, object]
+
+
+_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 
 def _parse_dt(s: str) -> datetime:

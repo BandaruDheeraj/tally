@@ -43,8 +43,8 @@ class AXRecordStore(RecordStore):
         api_key: str,
         space_id: str,
         project: str,
-        base_url: str = "https://otlp.arizeai.com",
-        gql_url: str = "https://app.arizeai.com/graphql",
+        base_url: str = "https://otlp.arize.com",
+        gql_url: str = "https://app.arize.com/graphql",
     ) -> None:
         self._project = project
         self._otlp_url = f"{base_url.rstrip('/')}/v1/traces"
@@ -59,7 +59,10 @@ class AXRecordStore(RecordStore):
         payload = {
             "resourceSpans": [
                 {
-                    "resource": {"attributes": []},
+                    "resource": {"attributes": [
+                        {"key": "openinference.project.name",
+                         "value": {"stringValue": self._project}},
+                    ]},
                     "scopeSpans": [
                         {
                             "scope": {"name": "tally"},

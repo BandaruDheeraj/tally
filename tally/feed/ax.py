@@ -85,7 +85,7 @@ class AXEvalSource(EvalSource):
         api_key: str,
         space_id: str,
         project: str,
-        base_url: str = "https://app.arizeai.com",
+        base_url: str = "https://app.arize.com",
     ) -> None:
         self._project = project
         self._gql_url = f"{base_url.rstrip('/')}/graphql"

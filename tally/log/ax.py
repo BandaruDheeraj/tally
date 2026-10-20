@@ -3,24 +3,15 @@ from __future__ import annotations
 import json
 import os
 import secrets
+import time
 from datetime import datetime
 from typing import Any
 
 import requests
 
 from tally.feed.source import _EPOCH, _parse_dt
-from tally.log.records import Record, RecordType, make_record
-from tally.log.store import RecordStore
-
-_LIST_RECORDS_QUERY = """
-query ListRecords($projectName: String!, $filterCondition: String!, $first: Int!) {
-    project(name: $projectName) {
-        spans(first: $first, filterCondition: $filterCondition) {
-            edges { node { name attributes } }
-        }
-    }
-}
-"""
+from tally.log.records import RecordType, make_record
+from tally.log.store import RecordStore, Record
 
 
 def _pad_trace_id(s: str) -> str:
@@ -36,33 +27,74 @@ def _pad_span_id(s: str) -> str:
 
 
 class AXRecordStore(RecordStore):
-    """RecordStore that writes via OTLP and reads via AX GraphQL."""
+    """RecordStore that writes via OTLP and reads via Arize AX v2 REST API."""
 
     def __init__(
         self,
         api_key: str,
         space_id: str,
         project: str,
-        base_url: str = "https://otlp.arize.com",
-        gql_url: str = "https://app.arize.com/graphql",
+        otlp_url: str = "https://otlp.arize.com/v1/traces",
+        rest_base: str = "https://api.arize.com/v2",
     ) -> None:
+        self._api_key = api_key
+        self._space_id = space_id
         self._project = project
-        self._otlp_url = f"{base_url.rstrip('/')}/v1/traces"
-        self._gql_url = gql_url
-        self._headers = {
-            "x-api-key": api_key,
-            "x-space-id": space_id,
+        self._otlp_url = otlp_url
+        self._rest_base = rest_base.rstrip("/")
+        self._project_id: str | None = None
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    @property
+    def _otlp_headers(self) -> dict[str, str]:
+        return {
+            "api_key": self._api_key,
+            "space_id": self._space_id,
             "content-type": "application/json",
         }
 
+    @property
+    def _rest_headers(self) -> dict[str, str]:
+        return {
+            "Authorization": f"Bearer {self._api_key}",
+            "content-type": "application/json",
+        }
+
+    def _get_project_id(self) -> str:
+        if self._project_id is not None:
+            return self._project_id
+        resp = requests.get(
+            f"{self._rest_base}/projects",
+            headers=self._rest_headers,
+            timeout=30,
+        )
+        resp.raise_for_status()
+        for project in resp.json().get("projects", []):
+            if project.get("name") == self._project:
+                self._project_id = str(project["id"])
+                return self._project_id
+        raise ValueError(f"Arize project {self._project!r} not found")
+
+    # ------------------------------------------------------------------
+    # RecordStore interface
+    # ------------------------------------------------------------------
+
     def write(self, record: Record) -> None:
+        now_ns = int(time.time() * 1_000_000_000)
         payload = {
             "resourceSpans": [
                 {
-                    "resource": {"attributes": [
-                        {"key": "openinference.project.name",
-                         "value": {"stringValue": self._project}},
-                    ]},
+                    "resource": {
+                        "attributes": [
+                            {
+                                "key": "openinference.project.name",
+                                "value": {"stringValue": self._project},
+                            },
+                        ]
+                    },
                     "scopeSpans": [
                         {
                             "scope": {"name": "tally"},
@@ -72,8 +104,8 @@ class AXRecordStore(RecordStore):
                                     "spanId": _pad_span_id(record.span_id),
                                     "name": record.type,
                                     "kind": 1,
-                                    "startTimeUnixNano": 0,
-                                    "endTimeUnixNano": 0,
+                                    "startTimeUnixNano": now_ns - 1_000_000_000,
+                                    "endTimeUnixNano": now_ns,
                                     "attributes": [
                                         {
                                             "key": "tally.record",
@@ -99,7 +131,12 @@ class AXRecordStore(RecordStore):
                 }
             ]
         }
-        resp = requests.post(self._otlp_url, headers=self._headers, json=payload, timeout=30)
+        resp = requests.post(
+            self._otlp_url,
+            headers=self._otlp_headers,
+            json=payload,
+            timeout=30,
+        )
         resp.raise_for_status()
 
     def list(
@@ -109,49 +146,59 @@ class AXRecordStore(RecordStore):
         span_id: str | None = None,
         type: RecordType | None = None,
     ) -> list[Record]:
-        parts: list[str] = [f"name == '{type}'" if type else "name != 'NONE'"]
-        if trace_id:
-            parts.append(f"attributes['tally.trace_id'] == '{trace_id}'")
-        if span_id:
-            parts.append(f"attributes['tally.span_id'] == '{span_id}'")
-        filter_cond = " and ".join(parts)
+        project_id = self._get_project_id()
         resp = requests.post(
-            self._gql_url,
-            headers=self._headers,
-            json={
-                "query": _LIST_RECORDS_QUERY,
-                "variables": {
-                    "projectName": self._project,
-                    "filterCondition": filter_cond,
-                    "first": 1000,
-                },
-            },
+            f"{self._rest_base}/spans",
+            headers=self._rest_headers,
+            json={"project_id": project_id},
             timeout=30,
         )
         resp.raise_for_status()
-        data: dict[str, Any] = resp.json()
+        body: dict[str, Any] = resp.json()
+        spans: list[dict[str, Any]] = body.get("spans", [])
+
         records: list[Record] = []
-        for edge in data["data"]["project"]["spans"]["edges"]:
-            node = edge["node"]
-            attrs: dict[str, object] = (
-                json.loads(node["attributes"])
-                if isinstance(node["attributes"], str)
-                else node["attributes"]
-            )
-            raw_record_str = str(attrs.get("tally.record", "{}"))
-            raw: dict[str, Any] = json.loads(raw_record_str)
-            r = make_record(
-                type=raw["type"],
-                trace_id=raw["trace_id"],
-                span_id=raw["span_id"],
-                customer_id=raw["customer_id"],
-                policy_name=raw["policy_name"],
-                policy_version=raw["policy_version"],
-                policy_hash=raw["policy_hash"],
-                payload=raw["payload"],
-            )
+        for span in spans:
+            # Filter by record type (span name)
+            if type is not None and span.get("name") != type:
+                continue
+
+            ctx = span.get("context", {})
+            raw_tid = str(ctx.get("trace_id", ""))
+            raw_sid = str(ctx.get("span_id", ""))
+
+            if trace_id is not None and raw_tid != trace_id:
+                continue
+            if span_id is not None and raw_sid != span_id:
+                continue
+
+            attrs: dict[str, Any] = span.get("attributes", {})
+            raw_str = str(attrs.get("tally.record", "{}"))
+            try:
+                raw: dict[str, Any] = json.loads(raw_str)
+            except json.JSONDecodeError:
+                continue
+
+            if not raw.get("type"):
+                continue
+
+            try:
+                r = make_record(
+                    type=raw["type"],
+                    trace_id=raw["trace_id"],
+                    span_id=raw["span_id"],
+                    customer_id=raw["customer_id"],
+                    policy_name=raw["policy_name"],
+                    policy_version=raw["policy_version"],
+                    policy_hash=raw["policy_hash"],
+                    payload=raw["payload"],
+                )
+            except KeyError:
+                continue
+
             if r.content_hash == raw.get("content_hash"):
                 records.append(r)
+
         return records
 
     def latest_cursor(self, policy_name: str) -> datetime:

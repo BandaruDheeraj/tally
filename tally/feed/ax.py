@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-import json
 import os
-from datetime import datetime
+import time
+from datetime import datetime, timezone
 from typing import Any
 
 import requests
@@ -17,36 +17,54 @@ from tally.feed.source import (
 )
 from tally.policy.declaration import Policy
 
-_LIST_SPANS_QUERY = """
-query ListSpans($projectName: String!, $filterCondition: String!, $first: Int!) {
-    project(name: $projectName) {
-        spans(first: $first, filterCondition: $filterCondition) {
-            edges { node {
-                context { traceId spanId }
-                name attributes endTime
-            }}
-        }
-    }
-}
-"""
+_REST_BASE = "https://api.arize.com/v2"
 
-_GET_EVALS_QUERY = """
-query GetEvals($projectName: String!, $filterCondition: String!) {
-    project(name: $projectName) {
-        spans(first: 1, filterCondition: $filterCondition) {
-            edges { node {
-                spanAnnotations {
-                    name label score explanation annotatorKind createdAt
+
+def _parse_eval_attrs(
+    attrs: dict[str, Any], end_time_str: str
+) -> list[EvalResult]:
+    """Parse eval.<name>.label / eval.<name>.score keys from a span's attributes dict."""
+    # Collect all eval names
+    names: set[str] = set()
+    for key in attrs:
+        if key.startswith("eval.") and (
+            key.endswith(".label") or key.endswith(".score")
+        ):
+            # key format: eval.<name>.label  or  eval.<name>.score
+            parts = key.split(".", 2)
+            if len(parts) == 3:
+                names.add(parts[1])
+
+    try:
+        scored_at = end_time_str or datetime.now(timezone.utc).isoformat()
+    except Exception:
+        scored_at = datetime.now(timezone.utc).isoformat()
+
+    results: list[EvalResult] = []
+    for name in sorted(names):
+        label_key = f"eval.{name}.label"
+        score_key = f"eval.{name}.score"
+        label = attrs.get(label_key)
+        score = attrs.get(score_key)
+        results.append(
+            _parse_eval_dict(
+                {
+                    "name": name,
+                    "label": label,
+                    "score": score,
+                    "explanation": "",
+                    "agreement": None,
+                    "evaluator_version": None,
+                    "scored_at": scored_at,
+                    "raw": {label_key: label, score_key: score},
                 }
-            }}
-        }
-    }
-}
-"""
+            )
+        )
+    return results
 
 
 def _parse_annotations(annotations: list[dict[str, Any]]) -> list[EvalResult]:
-    """Group AX span annotations by name and compute agreement."""
+    """Group span annotations by name and compute agreement (used for annotation-style evals)."""
     by_name: dict[str, list[dict[str, Any]]] = {}
     for ann in annotations:
         by_name.setdefault(str(ann["name"]), []).append(ann)
@@ -78,70 +96,111 @@ def _parse_annotations(annotations: list[dict[str, Any]]) -> list[EvalResult]:
 
 
 class AXEvalSource(EvalSource):
-    """EvalSource that reads from Arize AX (Phoenix) via GraphQL."""
+    """EvalSource that reads from Arize via the v2 REST API."""
 
     def __init__(
         self,
         api_key: str,
         space_id: str,
         project: str,
-        base_url: str = "https://app.arize.com",
+        rest_base: str = _REST_BASE,
     ) -> None:
         self._project = project
-        self._gql_url = f"{base_url.rstrip('/')}/graphql"
+        self._rest_base = rest_base.rstrip("/")
         self._headers = {
-            "x-api-key": api_key,
+            "Authorization": f"Bearer {api_key}",
             "x-space-id": space_id,
-            "content-type": "application/json",
+            "Content-Type": "application/json",
         }
+        # Span cache: avoid N+1 API calls within a single run_once() cycle
+        self._spans_cache: list[dict[str, Any]] | None = None
+        self._cache_time: float = 0.0
 
-    def _graphql(self, query: str, variables: dict[str, Any]) -> dict[str, Any]:
-        resp = requests.post(
-            self._gql_url,
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _get_project_id(self) -> str:
+        """Look up the numeric/string project ID for self._project by name."""
+        resp = requests.get(
+            f"{self._rest_base}/projects",
             headers=self._headers,
-            json={"query": query, "variables": variables},
             timeout=30,
         )
         resp.raise_for_status()
-        return resp.json()  # type: ignore[no-any-return]
+        data = resp.json()
+        for proj in data.get("projects", []):
+            if proj.get("name") == self._project:
+                return str(proj["id"])
+        raise KeyError(f"Project {self._project!r} not found in Arize space")
+
+    def _all_spans(self) -> list[dict[str, Any]]:
+        """Fetch all spans for the project; cached for 60 s."""
+        now = time.monotonic()
+        if self._spans_cache is not None and (now - self._cache_time) < 60.0:
+            return self._spans_cache
+
+        project_id = self._get_project_id()
+        resp = requests.post(
+            f"{self._rest_base}/spans",
+            headers=self._headers,
+            json={"project_id": project_id},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        spans: list[dict[str, Any]] = data.get("spans", [])
+        self._spans_cache = spans
+        self._cache_time = now
+        return spans
+
+    # ------------------------------------------------------------------
+    # EvalSource interface
+    # ------------------------------------------------------------------
 
     def list_new_spans(self, policy: Policy, cursor: datetime) -> list[SpanInfo]:
-        filter_cond = f"name == '{policy.span}' and end_time > '{cursor.isoformat()}'"
-        data = self._graphql(
-            _LIST_SPANS_QUERY,
-            {"projectName": self._project, "filterCondition": filter_cond, "first": 100},
-        )
         results: list[SpanInfo] = []
-        for edge in data["data"]["project"]["spans"]["edges"]:
-            node = edge["node"]
-            attrs: dict[str, object] = (
-                json.loads(node["attributes"])
-                if isinstance(node["attributes"], str)
-                else node["attributes"]
-            )
+        for span in self._all_spans():
+            # Filter by span name
+            if span.get("name") != policy.span:
+                continue
+            # Filter by end_time > cursor (client-side)
+            end_time_str = span.get("end_time", "")
+            try:
+                ended_at = _parse_dt(str(end_time_str))
+            except (ValueError, TypeError):
+                continue
+            if ended_at <= cursor:
+                continue
+            # Extract customer_id; skip span if attribute is missing
+            attrs: dict[str, Any] = span.get("attributes") or {}
+            ctx: dict[str, Any] = span.get("context") or {}
+            try:
+                customer_id = _extract_customer(policy.customer, attrs)
+            except KeyError:
+                continue
             results.append(
                 SpanInfo(
-                    trace_id=str(node["context"]["traceId"]),
-                    span_id=str(node["context"]["spanId"]),
-                    customer_id=_extract_customer(policy.customer, attrs),
-                    span_name=str(node["name"]),
-                    ended_at=_parse_dt(str(node["endTime"])),
+                    trace_id=str(ctx.get("trace_id", "")),
+                    span_id=str(ctx.get("span_id", "")),
+                    customer_id=customer_id,
+                    span_name=str(span.get("name", "")),
+                    ended_at=ended_at,
                 )
             )
         return results
 
     def get_evals(self, trace_id: str, span_id: str) -> list[EvalResult]:
-        filter_cond = (
-            f"context.trace_id == '{trace_id}' and context.span_id == '{span_id}'"
-        )
-        data = self._graphql(
-            _GET_EVALS_QUERY,
-            {"projectName": self._project, "filterCondition": filter_cond},
-        )
-        edges = data["data"]["project"]["spans"]["edges"]
-        if not edges:
-            return []
-        return _parse_annotations(edges[0]["node"]["spanAnnotations"])
+        for span in self._all_spans():
+            ctx: dict[str, Any] = span.get("context") or {}
+            if (
+                str(ctx.get("trace_id", "")) == trace_id
+                and str(ctx.get("span_id", "")) == span_id
+            ):
+                attrs: dict[str, Any] = span.get("attributes") or {}
+                end_time_str = span.get("end_time", "")
+                return _parse_eval_attrs(attrs, str(end_time_str))
+        return []
 
     @classmethod
     def from_env(cls) -> AXEvalSource:

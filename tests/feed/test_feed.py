@@ -3,12 +3,12 @@ from __future__ import annotations
 import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 import requests
 
-from tally.feed.ax import AXEvalSource
+from tally.feed.ax import AXEvalSource, _parse_eval_attrs
 from tally.feed.file import FileEvalSource
 from tally.feed.source import poll_interval
 from tally.policy.declaration import make_policy
@@ -104,173 +104,183 @@ def test_file_get_evals_unknown_span_returns_empty() -> None:
 
 
 # ---------------------------------------------------------------------------
-# AXEvalSource tests
+# AXEvalSource tests  (v2 REST API)
 # ---------------------------------------------------------------------------
 
+_PROJECTS_RESPONSE: dict[str, object] = {
+    "projects": [{"id": "pid-42", "name": "proj"}]
+}
 
-def _ax_list_spans_response(spans: list[dict[str, object]]) -> dict[str, object]:
-    """Build the GraphQL JSON response shape for list_new_spans."""
+
+def _v2_spans_response(spans: list[dict[str, object]]) -> dict[str, object]:
+    """Build the v2 REST /spans response shape."""
+    return {"spans": spans, "pagination": {}}
+
+
+def _v2_span(
+    trace_id: str,
+    span_id: str,
+    span_name: str,
+    attributes: dict[str, object],
+    end_time: str,
+) -> dict[str, object]:
+    """Convenience constructor for a v2 span dict."""
     return {
-        "data": {
-            "project": {
-                "spans": {
-                    "edges": [
-                        {
-                            "node": {
-                                "context": {
-                                    "traceId": s["trace_id"],
-                                    "spanId": s["span_id"],
-                                },
-                                "name": s["span_name"],
-                                "attributes": json.dumps(s["attributes"]),
-                                "endTime": s["ended_at"],
-                            }
-                        }
-                        for s in spans
-                    ]
-                }
-            }
-        }
+        "name": span_name,
+        "end_time": end_time,
+        "context": {"trace_id": trace_id, "span_id": span_id},
+        "attributes": attributes,
     }
 
 
-def _ax_get_evals_response(annotations: list[dict[str, object]]) -> dict[str, object]:
-    """Build the GraphQL JSON response shape for get_evals."""
-    return {
-        "data": {
-            "project": {
-                "spans": {
-                    "edges": [
-                        {
-                            "node": {
-                                "spanAnnotations": annotations
-                            }
-                        }
-                    ]
-                }
-            }
-        }
-    }
-
-
-
-def _mock_ax(return_value: dict[str, object]) -> MagicMock:
+def _mock_resp(return_value: dict[str, object]) -> MagicMock:
     mock_resp = MagicMock()
     mock_resp.json.return_value = return_value
     mock_resp.raise_for_status.return_value = None
     return mock_resp
 
 
-def test_ax_list_spans_returns_span_info() -> None:
+def _mock_ax_source(spans: list[dict[str, object]]) -> tuple[AXEvalSource, MagicMock, MagicMock]:
+    """Return (src, mock_get, mock_post) with GET→projects and POST→spans wired up."""
     src = AXEvalSource("key", "space", "proj")
-    raw_spans = [
-        {
-            "trace_id": "t1", "span_id": "s1",
-            "span_name": "post_review_comment",
-            "attributes": {"customer_id": "cust-1"},
-            "ended_at": "2024-06-01T10:00:00Z",
-        }
+    mock_get = _mock_resp(_PROJECTS_RESPONSE)
+    mock_post = _mock_resp(_v2_spans_response(spans))
+    return src, mock_get, mock_post
+
+
+def test_ax_list_spans_returns_span_info() -> None:
+    spans = [
+        _v2_span("t1", "s1", "post_review_comment", {"customer_id": "cust-1"}, "2024-06-01T10:00:00Z"),
     ]
-    with patch("requests.post", return_value=_mock_ax(_ax_list_spans_response(raw_spans))):
-        spans = src.list_new_spans(_policy(), cursor=CURSOR_BEFORE)
-    assert len(spans) == 1
-    assert spans[0].trace_id == "t1"
-    assert spans[0].customer_id == "cust-1"
+    src, mock_get, mock_post = _mock_ax_source(spans)
+    with patch("requests.get", return_value=mock_get), \
+         patch("requests.post", return_value=mock_post):
+        result = src.list_new_spans(_policy(), cursor=CURSOR_BEFORE)
+    assert len(result) == 1
+    assert result[0].trace_id == "t1"
+    assert result[0].customer_id == "cust-1"
+
+
+def test_ax_list_spans_filters_by_cursor() -> None:
+    spans = [
+        _v2_span("t1", "s1", "post_review_comment", {"customer_id": "cust-1"}, "2024-06-01T10:00:00Z"),
+        _v2_span("t2", "s2", "post_review_comment", {"customer_id": "cust-2"}, "2024-06-01T11:00:00Z"),
+    ]
+    src, mock_get, mock_post = _mock_ax_source(spans)
+    with patch("requests.get", return_value=mock_get), \
+         patch("requests.post", return_value=mock_post):
+        result = src.list_new_spans(_policy(), cursor=CURSOR_BETWEEN)
+    assert len(result) == 1
+    assert result[0].trace_id == "t2"
+
+
+def test_ax_list_spans_skips_span_missing_customer_attr() -> None:
+    spans = [
+        _v2_span("t1", "s1", "post_review_comment", {}, "2024-06-01T10:00:00Z"),
+    ]
+    src, mock_get, mock_post = _mock_ax_source(spans)
+    with patch("requests.get", return_value=mock_get), \
+         patch("requests.post", return_value=mock_post):
+        result = src.list_new_spans(_policy(customer="customer_id"), cursor=CURSOR_BEFORE)
+    assert result == []
 
 
 def test_ax_get_evals_returns_eval_result() -> None:
-    src = AXEvalSource("key", "space", "proj")
-    annotations: list[dict[str, object]] = [
-        {
-            "name": "fix_landed",
-            "label": "yes",
-            "score": 1.0,
-            "explanation": "The fix was applied",
-            "annotatorKind": "gpt-4",
-            "createdAt": "2024-06-01T11:00:00Z",
-        }
+    spans = [
+        _v2_span(
+            "t1", "s1", "some_span",
+            {"eval.fix_landed.label": "yes", "eval.fix_landed.score": 1.0},
+            "2024-06-01T11:00:00Z",
+        ),
     ]
-    with patch("requests.post", return_value=_mock_ax(_ax_get_evals_response(annotations))):
+    src, mock_get, mock_post = _mock_ax_source(spans)
+    with patch("requests.get", return_value=mock_get), \
+         patch("requests.post", return_value=mock_post):
         evals = src.get_evals("t1", "s1")
     assert len(evals) == 1
     e = evals[0]
     assert e.name == "fix_landed"
     assert e.label == "yes"
-    assert e.evaluator_version == "gpt-4"
-    assert e.agreement is None  # single annotation → None
+    assert e.score == 1.0
+    assert e.agreement is None  # attrs-based evals have no agreement concept
 
 
-def test_ax_get_evals_unanimous_on_matching_labels() -> None:
-    src = AXEvalSource("key", "space", "proj")
-    ann_base: dict[str, object] = {
-        "name": "q", "label": "yes", "score": 1.0, "explanation": "",
-        "createdAt": "2024-01-01T00:00:00Z",
-    }
-    annotations: list[dict[str, object]] = [
-        {**ann_base, "annotatorKind": "llm-1"},
-        {**ann_base, "annotatorKind": "llm-2"},
-    ]
-    with patch("requests.post", return_value=_mock_ax(_ax_get_evals_response(annotations))):
-        evals = src.get_evals("t1", "s1")
-    assert evals[0].agreement == "unanimous"
-
-
-def test_ax_get_evals_split_on_differing_labels() -> None:
-    src = AXEvalSource("key", "space", "proj")
-    ann_base: dict[str, object] = {
-        "name": "q", "explanation": "", "createdAt": "2024-01-01T00:00:00Z",
-    }
-    annotations: list[dict[str, object]] = [
-        {**ann_base, "label": "yes", "score": 1.0, "annotatorKind": "llm-1"},
-        {**ann_base, "label": "no",  "score": 0.0, "annotatorKind": "llm-2"},
-    ]
-    with patch("requests.post", return_value=_mock_ax(_ax_get_evals_response(annotations))):
-        evals = src.get_evals("t1", "s1")
-    assert evals[0].agreement == "split"
-
-
-def test_ax_get_evals_empty_edges_returns_empty() -> None:
-    src = AXEvalSource("key", "space", "proj")
-    with patch("requests.post", return_value=_mock_ax(_ax_list_spans_response([]))):
+def test_ax_get_evals_empty_returns_empty() -> None:
+    src, mock_get, mock_post = _mock_ax_source([])
+    with patch("requests.get", return_value=mock_get), \
+         patch("requests.post", return_value=mock_post):
         evals = src.get_evals("t1", "s1")
     assert evals == []
 
 
 def test_ax_get_evals_raises_on_http_error() -> None:
     src = AXEvalSource("key", "space", "proj")
-    mock_resp = MagicMock()
-    mock_resp.raise_for_status.side_effect = requests.HTTPError("500")
-    with patch("requests.post", return_value=mock_resp):
+    mock_get = _mock_resp(_PROJECTS_RESPONSE)
+    mock_post = MagicMock()
+    mock_post.raise_for_status.side_effect = requests.HTTPError("500")
+    with patch("requests.get", return_value=mock_get), \
+         patch("requests.post", return_value=mock_post):
         with pytest.raises(requests.HTTPError):
             src.get_evals("t1", "s1")
 
 
-def test_ax_parity_with_file_for_single_annotation() -> None:
-    """AXEvalSource and FileEvalSource produce identical EvalResult fields for the same data."""
-    file_src = FileEvalSource(FIXTURE)
-    file_evals = file_src.get_evals("trace-001", "span-001")
-
-    # Build AX mock to return the same logical data (single annotation, no agreement)
-    annotations: list[dict[str, object]] = [
-        {
-            "name": "fix_landed",
-            "label": "yes",
-            "score": 1.0,
-            "explanation": "The fix was applied",
-            "annotatorKind": "gpt-4",
-            "createdAt": "2024-06-01T11:00:00Z",
-        }
+def test_ax_spans_cache_avoids_extra_requests() -> None:
+    """Second call within 60 s must not re-issue HTTP requests."""
+    spans = [
+        _v2_span("t1", "s1", "post_review_comment", {"customer_id": "cust-1"}, "2024-06-01T10:00:00Z"),
     ]
-    ax_src = AXEvalSource("key", "space", "proj")
-    with patch("requests.post", return_value=_mock_ax(_ax_get_evals_response(annotations))):
-        ax_evals = ax_src.get_evals("trace-001", "span-001")
+    src, mock_get, mock_post = _mock_ax_source(spans)
+    with patch("requests.get", return_value=mock_get) as patched_get, \
+         patch("requests.post", return_value=mock_post) as patched_post:
+        src.list_new_spans(_policy(), cursor=CURSOR_BEFORE)
+        src.list_new_spans(_policy(), cursor=CURSOR_BEFORE)
+    # GET /projects and POST /spans should each be called only once (cache hit on second call)
+    assert patched_get.call_count == 1
+    assert patched_post.call_count == 1
 
-    assert len(file_evals) == len(ax_evals) == 1
-    f, a = file_evals[0], ax_evals[0]
-    assert f.name == a.name
-    assert f.label == a.label
-    assert f.score == a.score
-    assert f.explanation == a.explanation
-    assert f.agreement == a.agreement  # both None — single annotation
-    assert f.evaluator_version == a.evaluator_version
-    assert f.scored_at == a.scored_at
+
+# ---------------------------------------------------------------------------
+# _parse_eval_attrs unit tests
+# ---------------------------------------------------------------------------
+
+def test_parse_eval_attrs_extracts_label_and_score() -> None:
+    attrs = {"eval.deal_quality.label": "good", "eval.deal_quality.score": 0.85}
+    results = _parse_eval_attrs(attrs, "2024-06-01T10:00:00Z")
+    assert len(results) == 1
+    r = results[0]
+    assert r.name == "deal_quality"
+    assert r.label == "good"
+    assert r.score == 0.85
+
+
+def test_parse_eval_attrs_multiple_evals() -> None:
+    attrs = {
+        "eval.a.label": "yes",
+        "eval.a.score": 1.0,
+        "eval.b.label": "no",
+        "eval.b.score": 0.0,
+    }
+    results = _parse_eval_attrs(attrs, "2024-06-01T10:00:00Z")
+    names = {r.name for r in results}
+    assert names == {"a", "b"}
+
+
+def test_parse_eval_attrs_no_evals_returns_empty() -> None:
+    attrs = {"user.id": "u1", "llm.model": "gpt-4"}
+    assert _parse_eval_attrs(attrs, "2024-06-01T10:00:00Z") == []
+
+
+def test_parse_eval_attrs_label_only() -> None:
+    attrs = {"eval.q.label": "good"}
+    results = _parse_eval_attrs(attrs, "2024-06-01T10:00:00Z")
+    assert len(results) == 1
+    assert results[0].label == "good"
+    assert results[0].score is None
+
+
+def test_parse_eval_attrs_score_only() -> None:
+    attrs = {"eval.q.score": 0.5}
+    results = _parse_eval_attrs(attrs, "2024-06-01T10:00:00Z")
+    assert len(results) == 1
+    assert results[0].label is None
+    assert results[0].score == 0.5

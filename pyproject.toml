@@ -34,5 +34,8 @@ select = ["E", "F", "I", "S"]
 python_version = "3.12"
 strict = true
 
+[tool.setuptools.packages.find]
+include = ["tally*"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -5,6 +5,7 @@ import json
 import os
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -14,7 +15,11 @@ from pydantic import BaseModel
 
 import tally
 from demo.trip_planner import _analyse_deals, _search_deals, _send_span
+from tally import bill, no_charge
+from tally.feed.ax import AXEvalSource
 from tally.log.memory import InMemoryRecordStore
+from tally.log.records import make_record
+from tally.policy.engine import Unit, decide
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -24,12 +29,12 @@ _POLL_ATTEMPTS: int = 24
 _POLL_SLEEP: float = 5.0
 
 
-def _translate(evals: object) -> object:
+def translate(evals: object) -> object:
     dq = evals.get("deal_quality")  # type: ignore[union-attr]
     if dq is not None and dq.label == "good":  # type: ignore[union-attr]
-        return tally.bill(units=1)
-    label = dq.label if dq is not None else None  # type: ignore[union-attr]
-    return tally.no_charge(reason="deal_quality=" + str(label))
+        return bill(units=1)
+    label = dq.label if dq is not None else "none"  # type: ignore[union-attr]
+    return no_charge(reason="deal_quality=" + label)
 
 
 _POLICY = tally.policy(
@@ -37,7 +42,7 @@ _POLICY = tally.policy(
     span="plan_trip",
     customer="user.id",
     evals=["deal_quality"],
-    translate=_translate,
+    translate=translate,
 )
 
 
@@ -84,7 +89,81 @@ async def _plan_generator(destination: str, user_id: str):  # type: ignore[retur
         destination, plan_text, quality_label, quality_score,
     )
 
-    # Stages 5–7 added in Task 3
+    # Stage 5: poll Arize for evals
+    project = os.environ.get("TALLY_PROJECT", "tally-demo")
+    evals = []
+    for attempt in range(1, _POLL_ATTEMPTS + 1):
+        yield _sse("status", message=f"Waiting for eval... (attempt {attempt})")
+        source = AXEvalSource(api_key=api_key, space_id=space_id, project=project)
+        raw_evals = await loop.run_in_executor(
+            _executor, source.get_evals, trace_id, span_id
+        )
+        if raw_evals:
+            evals = raw_evals
+            break
+        await asyncio.sleep(_POLL_SLEEP)
+
+    if not evals:
+        yield _sse("decision", outcome="HOLD", units=0, reason="eval_timeout")
+        yield _sse("done")
+        return
+
+    # Stage 6: emit eval event
+    evals_dict = {e.name: e for e in evals}
+    yield _sse(
+        "eval",
+        evals={
+            name: {"label": e.label, "score": e.score}
+            for name, e in evals_dict.items()
+        },
+    )
+
+    # Stage 7: tally decide → store → decision event
+    now = datetime.now(tz=timezone.utc)
+    unit = Unit(
+        trace_id=trace_id,
+        span_id=span_id,
+        customer_id=user_id,
+        policy_name=_POLICY.name,
+        policy_version=_POLICY.version,
+        first_seen=now,
+        deadline=now + _POLICY.wait,
+    )
+    declared_evals = {n: evals_dict[n] for n in _POLICY.evals if n in evals_dict}
+    decision = decide(_POLICY, unit, declared_evals, {}, now)
+
+    if decision is None:
+        yield _sse("decision", outcome="HOLD", units=0, reason="no_decision")
+        yield _sse("done")
+        return
+
+    store.write(make_record(
+        type="DECISION",
+        trace_id=trace_id,
+        span_id=span_id,
+        customer_id=user_id,
+        policy_name=_POLICY.name,
+        policy_version=_POLICY.version,
+        policy_hash=_POLICY.version,
+        payload={
+            "decision": decision.outcome,
+            "units": decision.units,
+            "reason": decision.reason,
+            "review": decision.review,
+            "decided_at": decision.decided_at.isoformat(),
+            "eval_snapshot": decision.eval_snapshot,
+            "translate_source": _POLICY.translate,
+            "destination": destination,
+        },
+    ))
+
+    yield _sse(
+        "decision",
+        outcome=decision.outcome,
+        units=decision.units,
+        reason=decision.reason,
+        eval_snapshot=decision.eval_snapshot,
+    )
     yield _sse("done")
 
 

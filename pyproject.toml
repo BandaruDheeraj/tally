@@ -19,6 +19,12 @@ dev = [
     "mypy>=1.10",
     "types-requests>=2.31",
 ]
+demo = [
+    "fastapi>=0.111",
+    "uvicorn>=0.29",
+    "aiofiles>=23.0",
+    "httpx2>=0.28",
+]
 
 [tool.ruff]
 target-version = "py312"

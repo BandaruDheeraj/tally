@@ -50,17 +50,11 @@ def test_plan_generator_stages_1_to_4() -> None:
             "demo.app.main._send_span",
             return_value=("a" * 32, "b" * 16),
         ),
-        patch("demo.app.main.AXEvalSource") as mock_cls,
         patch.dict(
             "os.environ",
             {"ARIZE_API_KEY": "k", "ARIZE_SPACE_ID": "s"},
         ),
     ):
-        # Make the first get_evals call block forever so we only see stages 1-4
-        mock_source = MagicMock()
-        mock_cls.return_value = mock_source
-        mock_source.get_evals.return_value = []  # no evals → loop runs out
-
         from demo.app.main import _plan_generator
 
         events = asyncio.run(_collect(_plan_generator("Tokyo", "alice")))

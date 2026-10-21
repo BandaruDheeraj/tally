@@ -7,14 +7,13 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 import tally
 from demo.trip_planner import _analyse_deals, _search_deals, _send_span
-from tally.feed.ax import AXEvalSource
 from tally.log.memory import InMemoryRecordStore
 
 STATIC_DIR = Path(__file__).parent / "static"
@@ -58,7 +57,7 @@ def _sse(type: str, **data: object) -> str:
 
 
 async def _plan_generator(destination: str, user_id: str):  # type: ignore[return]
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
 
     # Stage 1: search
     yield _sse("status", message="Searching for deals...")

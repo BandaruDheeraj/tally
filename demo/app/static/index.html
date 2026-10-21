@@ -1,5 +1,74 @@
 <!DOCTYPE html>
 <html lang="en">
-<head><meta charset="UTF-8"><title>TravelAI</title></head>
-<body><p>Loading...</p></body>
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>TravelAI — powered by tally</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <div class="layout">
+
+    <!-- Left: Chat -->
+    <div class="chat-panel">
+      <header class="chat-header">
+        <span class="brand">TravelAI</span>
+        <span class="badge">powered by tally</span>
+      </header>
+      <div class="messages" id="messages"></div>
+      <form class="input-row" id="chat-form">
+        <input
+          type="text"
+          id="destination"
+          placeholder="Where do you want to go?"
+          autocomplete="off"
+        />
+        <input
+          type="text"
+          id="user-id"
+          placeholder="Your name"
+          value="alice"
+        />
+        <button type="submit">Plan Trip</button>
+      </form>
+    </div>
+
+    <!-- Right: Billing Ledger -->
+    <div class="billing-panel">
+      <div class="billing-header">
+        <span class="billing-title">Tally Billing</span>
+        <span class="mode-pill">shadow mode</span>
+      </div>
+      <table class="ledger">
+        <thead>
+          <tr>
+            <th>Destination</th>
+            <th>Decision</th>
+            <th>Score</th>
+            <th>Units</th>
+          </tr>
+        </thead>
+        <tbody id="ledger-body"></tbody>
+      </table>
+      <div class="ledger-footer" id="ledger-footer">No trips yet</div>
+      <details class="how-it-works">
+        <summary>How it works</summary>
+        <pre><code class="policy-code">def translate(evals):
+    dq = evals.get("deal_quality")
+    if dq is not None and dq.label == "good":
+        return bill(units=1)
+    label = dq.label if dq is not None else None
+    return no_charge(reason="deal_quality=" + str(label))</code></pre>
+        <p class="how-explanation">
+          Tally reads eval results from Arize AX after each AI response.
+          If <code>deal_quality = good</code>, the customer is billed
+          1 credit. Otherwise, no charge. Running in
+          <strong>shadow mode</strong> — no real Stripe charges.
+        </p>
+      </details>
+    </div>
+
+  </div>
+  <script src="/static/app.js"></script>
+</body>
 </html>

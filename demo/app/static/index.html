@@ -57,8 +57,8 @@
     dq = evals.get("deal_quality")
     if dq is not None and dq.label == "good":
         return bill(units=1)
-    label = dq.label if dq is not None else None
-    return no_charge(reason="deal_quality=" + str(label))</code></pre>
+    label = dq.label if dq is not None else "none"
+    return no_charge(reason="deal_quality=" + label)</code></pre>
         <p class="how-explanation">
           Tally reads eval results from Arize AX after each AI response.
           If <code>deal_quality = good</code>, the customer is billed

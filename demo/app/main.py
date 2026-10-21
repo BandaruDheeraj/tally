@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import uuid
+from collections.abc import AsyncGenerator
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
@@ -61,110 +62,114 @@ def _sse(type: str, **data: object) -> str:
     return "data: " + json.dumps({"type": type, **data}) + "\n\n"
 
 
-async def _plan_generator(destination: str, user_id: str):  # type: ignore[return]
-    loop = asyncio.get_running_loop()
+async def _plan_generator(destination: str, user_id: str) -> AsyncGenerator[str, None]:
+    try:
+        loop = asyncio.get_running_loop()
 
-    # Stage 1: search
-    yield _sse("status", message="Searching for deals...")
-    results = await loop.run_in_executor(_executor, _search_deals, destination)
+        # Stage 1: search
+        yield _sse("status", message="Searching for deals...")
+        results = await loop.run_in_executor(_executor, _search_deals, destination)
 
-    # Stage 2: LLM analysis
-    yield _sse("status", message="Analysing with LLM...")
-    plan_text, quality_label, quality_score = await loop.run_in_executor(
-        _executor, _analyse_deals, destination, results
-    )
-
-    # Stage 3: stream plan text
-    yield _sse("chunk", text=plan_text)
-
-    # Stage 4: send span to Arize
-    yield _sse("status", message="Sending span to Arize...")
-    api_key = os.environ["ARIZE_API_KEY"]
-    space_id = os.environ["ARIZE_SPACE_ID"]
-    session_id = uuid.uuid4().hex
-    trace_id, span_id = await loop.run_in_executor(
-        _executor,
-        _send_span,
-        api_key, space_id, user_id, session_id,
-        destination, plan_text, quality_label, quality_score,
-    )
-
-    # Stage 5: poll Arize for evals
-    project = os.environ.get("TALLY_PROJECT", "tally-demo")
-    evals = []
-    for attempt in range(1, _POLL_ATTEMPTS + 1):
-        yield _sse("status", message=f"Waiting for eval... (attempt {attempt})")
-        source = AXEvalSource(api_key=api_key, space_id=space_id, project=project)
-        raw_evals = await loop.run_in_executor(
-            _executor, source.get_evals, trace_id, span_id
+        # Stage 2: LLM analysis
+        yield _sse("status", message="Analysing with LLM...")
+        plan_text, quality_label, quality_score = await loop.run_in_executor(
+            _executor, _analyse_deals, destination, results
         )
-        if raw_evals:
-            evals = raw_evals
-            break
-        await asyncio.sleep(_POLL_SLEEP)
 
-    if not evals:
-        yield _sse("decision", outcome="HOLD", units=0, reason="eval_timeout")
+        # Stage 3: stream plan text
+        yield _sse("chunk", text=plan_text)
+
+        # Stage 4: send span to Arize
+        yield _sse("status", message="Sending span to Arize...")
+        api_key = os.environ["ARIZE_API_KEY"]
+        space_id = os.environ["ARIZE_SPACE_ID"]
+        session_id = uuid.uuid4().hex
+        trace_id, span_id = await loop.run_in_executor(
+            _executor,
+            _send_span,
+            api_key, space_id, user_id, session_id,
+            destination, plan_text, quality_label, quality_score,
+        )
+
+        # Stage 5: poll Arize for evals
+        project = os.environ.get("TALLY_PROJECT", "tally-demo")
+        evals = []
+        for attempt in range(1, _POLL_ATTEMPTS + 1):
+            yield _sse("status", message=f"Waiting for eval... (attempt {attempt})")
+            source = AXEvalSource(api_key=api_key, space_id=space_id, project=project)
+            raw_evals = await loop.run_in_executor(
+                _executor, source.get_evals, trace_id, span_id
+            )
+            if raw_evals:
+                evals = raw_evals
+                break
+            await asyncio.sleep(_POLL_SLEEP)
+
+        if not evals:
+            yield _sse("decision", outcome="HOLD", units=0, reason="eval_timeout")
+            yield _sse("done")
+            return
+
+        # Stage 6: emit eval event
+        evals_dict = {e.name: e for e in evals}
+        yield _sse(
+            "eval",
+            evals={
+                name: {"label": e.label, "score": e.score}
+                for name, e in evals_dict.items()
+            },
+        )
+
+        # Stage 7: tally decide → store → decision event
+        now = datetime.now(tz=timezone.utc)
+        unit = Unit(
+            trace_id=trace_id,
+            span_id=span_id,
+            customer_id=user_id,
+            policy_name=_POLICY.name,
+            policy_version=_POLICY.version,
+            first_seen=now,
+            deadline=now + _POLICY.wait,
+        )
+        declared_evals = {n: evals_dict[n] for n in _POLICY.evals if n in evals_dict}
+        decision = decide(_POLICY, unit, declared_evals, {}, now)
+
+        if decision is None:
+            yield _sse("decision", outcome="HOLD", units=0, reason="no_decision")
+            yield _sse("done")
+            return
+
+        store.write(make_record(
+            type="DECISION",
+            trace_id=trace_id,
+            span_id=span_id,
+            customer_id=user_id,
+            policy_name=_POLICY.name,
+            policy_version=_POLICY.version,
+            policy_hash=_POLICY.version,
+            payload={
+                "decision": decision.outcome,
+                "units": decision.units,
+                "reason": decision.reason,
+                "review": decision.review,
+                "decided_at": decision.decided_at.isoformat(),
+                "eval_snapshot": decision.eval_snapshot,
+                "translate_source": _POLICY.translate,
+                "destination": destination,
+            },
+        ))
+
+        yield _sse(
+            "decision",
+            outcome=decision.outcome,
+            units=decision.units,
+            reason=decision.reason,
+            eval_snapshot=decision.eval_snapshot,
+        )
         yield _sse("done")
-        return
-
-    # Stage 6: emit eval event
-    evals_dict = {e.name: e for e in evals}
-    yield _sse(
-        "eval",
-        evals={
-            name: {"label": e.label, "score": e.score}
-            for name, e in evals_dict.items()
-        },
-    )
-
-    # Stage 7: tally decide → store → decision event
-    now = datetime.now(tz=timezone.utc)
-    unit = Unit(
-        trace_id=trace_id,
-        span_id=span_id,
-        customer_id=user_id,
-        policy_name=_POLICY.name,
-        policy_version=_POLICY.version,
-        first_seen=now,
-        deadline=now + _POLICY.wait,
-    )
-    declared_evals = {n: evals_dict[n] for n in _POLICY.evals if n in evals_dict}
-    decision = decide(_POLICY, unit, declared_evals, {}, now)
-
-    if decision is None:
-        yield _sse("decision", outcome="HOLD", units=0, reason="no_decision")
+    except Exception as exc:  # noqa: BLE001
+        yield _sse("error", message=str(exc))
         yield _sse("done")
-        return
-
-    store.write(make_record(
-        type="DECISION",
-        trace_id=trace_id,
-        span_id=span_id,
-        customer_id=user_id,
-        policy_name=_POLICY.name,
-        policy_version=_POLICY.version,
-        policy_hash=_POLICY.version,
-        payload={
-            "decision": decision.outcome,
-            "units": decision.units,
-            "reason": decision.reason,
-            "review": decision.review,
-            "decided_at": decision.decided_at.isoformat(),
-            "eval_snapshot": decision.eval_snapshot,
-            "translate_source": _POLICY.translate,
-            "destination": destination,
-        },
-    ))
-
-    yield _sse(
-        "decision",
-        outcome=decision.outcome,
-        units=decision.units,
-        reason=decision.reason,
-        eval_snapshot=decision.eval_snapshot,
-    )
-    yield _sse("done")
 
 
 @app.get("/")

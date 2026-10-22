@@ -24,6 +24,8 @@ demo = [
     "fastapi>=0.111",
     "uvicorn>=0.29",
     "aiofiles>=23.0",
+    "anthropic>=0.40",
+    "ddgs>=6.0",
 ]
 
 [tool.ruff]

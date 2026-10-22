@@ -17,7 +17,7 @@ from pydantic import BaseModel
 import tally
 from demo.trip_planner import _analyse_deals, _search_deals, _send_span
 from tally import bill, no_charge
-from tally.feed.ax import AXEvalSource
+from tally.feed.ax import AXEvalSource, _parse_eval_attrs
 from tally.log.memory import InMemoryRecordStore
 from tally.log.records import make_record
 from tally.policy.engine import Unit, decide
@@ -62,6 +62,20 @@ def _sse(type: str, **data: object) -> str:
     return "data: " + json.dumps({"type": type, **data}) + "\n\n"
 
 
+def _evals_by_session(source: AXEvalSource, session_id: str) -> list:
+    """Find a span by session.id and extract its embedded evals.
+
+    Arize re-encodes OTLP trace/span IDs on ingest (treats hex as base64),
+    so we cannot match by trace_id/span_id. session.id is a plain string
+    attribute that Arize preserves exactly, making it a reliable lookup key.
+    """
+    for span in source._all_spans():
+        attrs: dict = span.get("attributes") or {}
+        if attrs.get("session.id") == session_id:
+            return _parse_eval_attrs(attrs, str(span.get("end_time", "")))
+    return []
+
+
 async def _plan_generator(destination: str, user_id: str) -> AsyncGenerator[str, None]:
     try:
         loop = asyncio.get_running_loop()
@@ -91,14 +105,16 @@ async def _plan_generator(destination: str, user_id: str) -> AsyncGenerator[str,
             destination, plan_text, quality_label, quality_score,
         )
 
-        # Stage 5: poll Arize for evals
+        # Stage 5: poll Arize for evals by session.id
+        # (Arize transforms OTLP trace/span IDs on ingest, so we match by
+        # the session.id attribute which is preserved exactly as sent.)
         project = os.environ.get("TALLY_PROJECT", "tally-demo")
         evals = []
         for attempt in range(1, _POLL_ATTEMPTS + 1):
             yield _sse("status", message=f"Waiting for eval... (attempt {attempt})")
             source = AXEvalSource(api_key=api_key, space_id=space_id, project=project)
             raw_evals = await loop.run_in_executor(
-                _executor, source.get_evals, trace_id, span_id
+                _executor, _evals_by_session, source, session_id
             )
             if raw_evals:
                 evals = raw_evals

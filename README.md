@@ -1,8 +1,10 @@
 # tally-billing
 
-Turn Arize AX eval results into Stripe meter events — usage-based billing for AI agents, driven by output quality.
+AI agents are selling outcomes, not API calls. Tally lets you price them that way.
 
-**How it works:** Your AI agent runs and sends traces to Arize. Tally watches those traces, reads the evaluation scores Arize computes, and fires Stripe meter events only when the agent actually delivered value. Bad output = no charge.
+Attach customer-facing evals to your agent's output and charge only when the agent actually delivered value — good results bill, bad results don't. Tally reads your Arize eval scores and fires Stripe meter events automatically, so your pricing reflects the service your agent provided.
+
+**How it works:** Your AI agent runs and sends traces to Arize. Tally watches those traces, reads the evaluation scores Arize computes, and fires Stripe meter events only when the agent delivered. Bad output = no charge.
 
 ---
 

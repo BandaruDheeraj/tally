@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import time
 import uuid
 from collections.abc import AsyncGenerator
 from concurrent.futures import ThreadPoolExecutor
@@ -14,10 +15,12 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+import requests as _requests
 import tally
 from demo.trip_planner import _analyse_deals, _search_deals, _send_span
 from tally import bill, no_charge
-from tally.feed.ax import AXEvalSource, _parse_eval_attrs
+from tally.feed.ax import AXEvalSource, _parse_eval_attrs, _parse_evaluations
+from tally.feed.source import _parse_dt
 from tally.log.memory import InMemoryRecordStore
 from tally.log.records import make_record
 from tally.policy.engine import Unit, decide
@@ -29,12 +32,15 @@ _executor = ThreadPoolExecutor(max_workers=4)
 _POLL_ATTEMPTS: int = 24
 _POLL_SLEEP: float = 5.0
 
+# Arize evaluator task ID (Deal Quality - tally-demo)
+_ARIZE_TASK_ID = "T25saW5lVGFzazo1MTg5NDpVMkk5"
+_ARIZE_REST_BASE = "https://api.arize.com/v2"
+
 
 def translate(evals: object) -> object:
     dq = evals.get("deal_quality")  # type: ignore[union-attr]
     if dq is not None and dq.label == "good":  # type: ignore[union-attr]
-        units = round(100 * dq.score)  # type: ignore[union-attr]
-        return bill(units=units)
+        return bill(units=100)
     label = dq.label if dq is not None else "none"  # type: ignore[union-attr]
     return no_charge(reason="deal_quality=" + label)
 
@@ -63,16 +69,93 @@ def _sse(type: str, **data: object) -> str:
     return "data: " + json.dumps({"type": type, **data}) + "\n\n"
 
 
+def _trigger_and_wait_eval(
+    api_key: str,
+    space_id: str,
+    session_id: str,
+    project_id: str,
+    span_end_time: str,
+    max_wait: int = 90,
+) -> None:
+    """Wait for span ingest, trigger Arize evaluator task, wait for completion."""
+    from datetime import timedelta
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "x-space-id": space_id,
+        "Content-Type": "application/json",
+    }
+
+    # Step 1: wait until span appears in Arize (up to 30s)
+    for _ in range(10):
+        time.sleep(3)
+        r = _requests.post(
+            f"{_ARIZE_REST_BASE}/spans",
+            headers=headers,
+            json={"project_id": project_id},
+            timeout=15,
+        )
+        r.raise_for_status()
+        spans = r.json().get("spans", [])
+        for span in spans:
+            attrs: dict = span.get("attributes") or {}
+            if attrs.get("session.id") == session_id:
+                span_end_time = str(span.get("end_time", span_end_time))
+                break
+        else:
+            continue
+        break  # found the span
+
+    # Step 2: trigger evaluator task for the span's time window
+    try:
+        end_dt = _parse_dt(span_end_time)
+    except Exception:
+        end_dt = datetime.now(tz=timezone.utc)
+
+
+    window_start = (end_dt - timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    window_end = (end_dt + timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    resp = _requests.post(
+        f"{_ARIZE_REST_BASE}/tasks/{_ARIZE_TASK_ID}/trigger",
+        headers=headers,
+        json={"data_start_time": window_start, "data_end_time": window_end},
+        timeout=15,
+    )
+    resp.raise_for_status()
+    run_id = resp.json()["id"]
+
+    # Step 3: poll until task run COMPLETED or FAILED
+    for _ in range(max_wait // 3):
+        time.sleep(3)
+        r = _requests.get(
+            f"{_ARIZE_REST_BASE}/task-runs/{run_id}",
+            headers=headers,
+            timeout=15,
+        )
+        r.raise_for_status()
+        status = r.json().get("status", "")
+        if status in ("COMPLETED", "FAILED", "CANCELED"):
+            return
+    # Timed out — caller will still attempt to read evals
+
+
 def _evals_by_session(source: AXEvalSource, session_id: str) -> list:
-    """Find a span by session.id and extract its embedded evals.
+    """Find a span by session.id and return its Arize-computed evaluations.
 
     Arize re-encodes OTLP trace/span IDs on ingest (treats hex as base64),
     so we cannot match by trace_id/span_id. session.id is a plain string
     attribute that Arize preserves exactly, making it a reliable lookup key.
+
+    Evals come from span["evaluations"] — results written by Arize's
+    continuous LLM evaluator task, not from span attributes we self-embed.
     """
     for span in source._all_spans():
         attrs: dict = span.get("attributes") or {}
         if attrs.get("session.id") == session_id:
+            evaluations: list = span.get("evaluations") or []
+            if evaluations:
+                return _parse_evaluations(evaluations)
+            # Fall back to embedded eval attrs only if evaluations not present yet
             return _parse_eval_attrs(attrs, str(span.get("end_time", "")))
     return []
 
@@ -98,18 +181,33 @@ async def _plan_generator(destination: str, user_id: str) -> AsyncGenerator[str,
         yield _sse("status", message="Sending span to Arize...")
         api_key = os.environ["ARIZE_API_KEY"]
         space_id = os.environ["ARIZE_SPACE_ID"]
+        project = os.environ.get("TALLY_PROJECT", "tally-demo")
         session_id = uuid.uuid4().hex
+        span_end_time = datetime.now(tz=timezone.utc).isoformat()
         trace_id, span_id = await loop.run_in_executor(
             _executor,
             _send_span,
             api_key, space_id, user_id, session_id,
-            destination, plan_text, quality_label, quality_score,
+            destination, plan_text,
+        )
+
+        # Stage 4.5: trigger Arize LLM evaluator and wait for it to score this span.
+        # Arize's continuous task runs on its own schedule; we trigger it explicitly
+        # after confirming the span is indexed, so the eval is ready within ~30s.
+        yield _sse("status", message="Triggering Arize evaluator...")
+        source_for_trigger = AXEvalSource(api_key=api_key, space_id=space_id, project=project)
+        arize_project_id = await loop.run_in_executor(
+            _executor, source_for_trigger._get_project_id
+        )
+        await loop.run_in_executor(
+            _executor,
+            _trigger_and_wait_eval,
+            api_key, space_id, session_id, arize_project_id, span_end_time,
         )
 
         # Stage 5: poll Arize for evals by session.id
         # (Arize transforms OTLP trace/span IDs on ingest, so we match by
         # the session.id attribute which is preserved exactly as sent.)
-        project = os.environ.get("TALLY_PROJECT", "tally-demo")
         evals = []
         for attempt in range(1, _POLL_ATTEMPTS + 1):
             yield _sse("status", message=f"Waiting for eval... (attempt {attempt})")

@@ -117,9 +117,9 @@ Respond with ONLY a valid JSON object (no markdown):
 Rules:
 - "deal_quality" must be exactly "good" or "poor"
 - "score" must be a number between 0.0 and 1.0
-- "good" = real destination with clear deals and actual prices found
-- "poor" = fictional/impossible destination, vague results, or no real deals
-- A trip to a fictional or non-existent place (e.g. Mars, Narnia) must be rated "poor" — there are no real deals"""
+- "good" = the response gives the user actionable travel information (real deals, prices, or a clear honest explanation of what IS available)
+- "poor" = the response is useless — no real information, only made-up prices, or completely generic filler with nothing actionable
+- Rate based on output quality, not destination validity — a response that honestly explains limitations and offers what IS available is "good\""""
 
 
 def _call_openrouter(prompt: str, api_key: str) -> str:
@@ -211,10 +211,12 @@ def _send_span(
     session_id: str,
     destination: str,
     plan: str,
-    deal_quality_label: str,
-    deal_quality_score: float,
 ) -> tuple[str, str]:
-    """Send a plan_trip span to Arize. Returns (trace_id, span_id)."""
+    """Send a plan_trip span to Arize. Returns (trace_id, span_id).
+
+    No eval attributes are embedded — Arize runs its own LLM evaluator
+    (Deal Quality task) against input.value / output.value after ingest.
+    """
     trace_id = uuid.uuid4().hex
     span_id = uuid.uuid4().hex[:16]
     now_ns = int(time.time() * 1_000_000_000)
@@ -250,11 +252,6 @@ def _send_span(
                      "value": {"stringValue": "text/plain"}},
                     {"key": "destination",
                      "value": {"stringValue": destination}},
-                    # Eval attributes — read back by AXEvalSource
-                    {"key": "eval.deal_quality.label",
-                     "value": {"stringValue": deal_quality_label}},
-                    {"key": "eval.deal_quality.score",
-                     "value": {"doubleValue": deal_quality_score}},
                 ],
             }]}],
         }]
@@ -304,8 +301,7 @@ def plan_trip(
 
     print("\nSending span to Arize...")
     trace_id, span_id = _send_span(
-        api_key, space_id, user_id, session_id, destination,
-        plan, quality_label, quality_score,
+        api_key, space_id, user_id, session_id, destination, plan,
     )
     print(f"  OK  trace={trace_id[:12]}...  span={span_id[:12]}...")
 

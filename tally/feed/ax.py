@@ -63,6 +63,27 @@ def _parse_eval_attrs(
     return results
 
 
+def _parse_evaluations(evaluations: list[dict[str, Any]]) -> list[EvalResult]:
+    """Parse the span.evaluations[] array returned by Arize LLM evaluator tasks."""
+    results: list[EvalResult] = []
+    for ev in evaluations:
+        results.append(
+            _parse_eval_dict(
+                {
+                    "name": str(ev.get("name", "")),
+                    "label": ev.get("label"),
+                    "score": ev.get("score"),
+                    "explanation": ev.get("explanation") or "",
+                    "agreement": None,
+                    "evaluator_version": None,
+                    "scored_at": datetime.now(timezone.utc).isoformat(),
+                    "raw": ev,
+                }
+            )
+        )
+    return results
+
+
 def _parse_annotations(annotations: list[dict[str, Any]]) -> list[EvalResult]:
     """Group span annotations by name and compute agreement (used for annotation-style evals)."""
     by_name: dict[str, list[dict[str, Any]]] = {}

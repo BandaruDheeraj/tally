@@ -109,15 +109,17 @@ Search results:
 
 Respond with ONLY a valid JSON object (no markdown):
 {{
-  "plan": "2-3 paragraph trip plan with specific deal recommendations and estimated prices",
-  "deal_quality": "good",
-  "score": 0.85
+  "plan": "<2-3 paragraph trip plan with specific deal recommendations and estimated prices>",
+  "deal_quality": "<good|poor>",
+  "score": <0.0 to 1.0>
 }}
 
 Rules:
 - "deal_quality" must be exactly "good" or "poor"
 - "score" must be a number between 0.0 and 1.0
-- "good" = clear deals with prices found, "poor" = vague or no real deals"""
+- "good" = real destination with clear deals and actual prices found
+- "poor" = fictional/impossible destination, vague results, or no real deals
+- A trip to a fictional or non-existent place (e.g. Mars, Narnia) must be rated "poor" — there are no real deals"""
 
 
 def _call_openrouter(prompt: str, api_key: str) -> str:

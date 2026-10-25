@@ -33,7 +33,8 @@ _POLL_SLEEP: float = 5.0
 def translate(evals: object) -> object:
     dq = evals.get("deal_quality")  # type: ignore[union-attr]
     if dq is not None and dq.label == "good":  # type: ignore[union-attr]
-        return bill(units=1)
+        units = round(100 * dq.score)  # type: ignore[union-attr]
+        return bill(units=units)
     label = dq.label if dq is not None else "none"  # type: ignore[union-attr]
     return no_charge(reason="deal_quality=" + label)
 

@@ -2,9 +2,9 @@
 
 AI agents are selling outcomes, not API calls. Tally lets you price them that way.
 
-Attach customer-facing evals to your agent's output and charge only when the agent actually delivered value — good results bill, bad results don't. Tally reads your Arize eval scores and fires Stripe meter events automatically, so your pricing reflects the service your agent provided.
+Attach customer-facing evals to your agent's output and charge only when the agent actually delivered value — good results bill, bad results don't. An independent LLM judge (running inside Arize) evaluates every response. Tally reads those scores and fires Stripe meter events automatically, so your pricing reflects the service your agent actually provided — not what it claimed to provide.
 
-**How it works:** Your AI agent runs and sends traces to Arize. Tally watches those traces, reads the evaluation scores Arize computes, and fires Stripe meter events only when the agent delivered. Bad output = no charge.
+**How it works:** Your AI agent runs and sends a trace to Arize. Arize runs an LLM-as-a-judge evaluator on the output. Tally reads that independent verdict and fires a Stripe meter event only when the agent delivered. Bad output = no charge.
 
 ---
 
@@ -59,6 +59,60 @@ export TALLY_PROJECT="tally-demo"       # must match a project name in Arize
 
 Log into [app.arize.com](https://app.arize.com), go to your space, and create a new project named `tally-demo` (or whatever you set `TALLY_PROJECT` to). Tally will send traces there.
 
+### Step 2b — Create an LLM evaluator in Arize
+
+Tally needs Arize to run an independent judge on your agent's output. Create one via the Arize REST API:
+
+```bash
+# 1. Create the evaluator (swap in your API key and space ID)
+curl -X POST "https://api.arize.com/v2/evaluators" \
+  -H "Authorization: Bearer $ARIZE_API_KEY" \
+  -H "x-space-id: $ARIZE_SPACE_ID" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "Deal Quality",
+    "space_id": "<your-space-id>",
+    "type": "TEMPLATE",
+    "version": {
+      "commit_message": "Initial version",
+      "template_config": {
+        "name": "deal_quality",
+        "template": "You are evaluating the quality of a travel agent response.\n\nThe user asked:\n{input}\n\nThe travel agent responded:\n{output}\n\nDoes this response give the user genuinely useful, actionable travel information?\n\nA response that honestly explains limitations and offers what IS available is GOOD.\nA response with made-up prices, hallucinated destinations, or zero useful information is POOR.\n\nRespond with a single word: good or poor",
+        "include_explanations": false,
+        "use_function_calling": false,
+        "classification_choices": {"good": 1, "poor": 0},
+        "llm_config": {
+          "ai_integration_id": "<your-ai-integration-id>",
+          "model_name": "<model-name>",
+          "invocation_parameters": {"temperature": 0}
+        }
+      }
+    }
+  }'
+
+# 2. Wire it to your project as a continuous task (use the evaluator ID from step 1)
+curl -X POST "https://api.arize.com/v2/tasks" \
+  -H "Authorization: Bearer $ARIZE_API_KEY" \
+  -H "x-space-id: $ARIZE_SPACE_ID" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "Deal Quality Eval - tally-demo",
+    "type": "TEMPLATE_EVALUATION",
+    "project_id": "<your-project-id>",
+    "sampling_rate": 1.0,
+    "is_continuous": true,
+    "evaluators": [{
+      "evaluator_id": "<evaluator-id-from-step-1>",
+      "column_mappings": {
+        "input": "attributes.input.value",
+        "output": "attributes.output.value"
+      }
+    }]
+  }'
+```
+
+Save the `task_id` from the response — you'll need to set it in `demo/app/main.py` as `_ARIZE_TASK_ID`.
+
 ### Step 3 — Start the demo
 
 ```bash
@@ -72,16 +126,18 @@ Open **http://localhost:8000** in your browser.
 Type a destination (e.g. `Tokyo`) and your name, then click **Plan Trip**. Watch the pipeline run live:
 
 1. The agent searches for flights and hotels
-2. The LLM analyses the deals and rates their quality
-3. A trace span is sent to Arize
-4. Tally polls Arize until the eval result appears
-5. The billing decision fires: **BILL 1 unit** if deals were good, **NO CHARGE** if not
+2. The LLM writes a trip plan
+3. A trace span (input + output) is sent to Arize
+4. Arize runs an independent LLM-as-a-judge evaluator on the output
+5. Tally reads the verdict and fires the billing decision: **BILL 100 units** if the response was useful, **NO CHARGE** if not
 
 The right panel shows a running billing ledger for your session.
 
 ### Step 5 — Test the no-charge path
 
-Try a nonsense destination like `XYZZY_NOWHERE_12345`. The LLM will rate the results `poor` and tally will return **NO CHARGE** — the customer pays nothing when the agent doesn't deliver value.
+Try a nonsense destination like `Blorbville`. The agent will hallucinate fake flight prices — Arize's independent judge will rate it `poor` and tally will return **NO CHARGE**. The customer pays nothing when the agent makes things up.
+
+For contrast, ask for `Mars`. A good agent response honestly explains the planet isn't accessible and redirects to real options — Arize rates that `good` and the customer is billed, because they got genuine value.
 
 ---
 
@@ -192,13 +248,14 @@ run(
 Your agent runs
       │
       ▼
-Span sent to Arize (via OTLP)
+Span sent to Arize (input + output, via OTLP)
       │
       ▼
-Arize evaluates the output (deal_quality, output_quality, etc.)
+Arize runs LLM-as-a-judge on the output
+(independent evaluator — not the agent itself)
       │
       ▼
-Tally polls Arize for eval results
+Tally polls Arize for the eval verdict
       │
       ▼
 translate(evals) → bill / no_charge / hold
